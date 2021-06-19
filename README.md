@@ -1,2 +1,4 @@
-# kaggle_dataset_forecastanalysis_06192021
-Kaggle - Dataset - Forecast Analysis - 06192021
+# ABOUT
+
+- Kaggle - Dataset - Forecast Analysis - 06192021
+- Published: https://rpubs.com/cxh190001/783190
