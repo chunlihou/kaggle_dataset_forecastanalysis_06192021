@@ -1,0 +1,354 @@
+---
+title: "Forecast Analysis"
+author: "Chun-Li Hou"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# Objective
+
+We focus on the time series for Google stock.
+
+# Preparation
+
+## Environment
+
+Let us set up the working environment and be ready for the analysis.
+
+```{r}
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(tidymodels, modeltime,
+               tidyverse, timetk, lubridate, janitor, tidyquant,
+               ggthemes, ggsci,
+               gt)
+theme = theme_bw() +
+  theme(plot.title = element_text(face = "bold", size = (15)),
+        plot.subtitle = element_text(size = (10)),
+        axis.title = element_text(size = (10))) +
+  theme(axis.text.x = element_text(angle = 0), legend.position = "none")
+```
+
+## Dataset
+
+The dataset contains the follwing features:
+
+- Data: time feature, and it would be engineering for few steps
+- Open: at what price does the stock open on the day at 9:00 am ET
+- High: highest stock price during the day
+- Low: lowest stock price during the day
+- Close: at what price does the stock end on the day at 5:00 pm ET
+- Volume: the number of shares trade during the day
+
+```{r}
+tbl = read_csv("DATA.csv")
+stock_filtered_tbl = tbl %>% 
+  set_names(names(.) %>% str_to_lower()) %>% 
+  filter_by_time(.start_date = "2016") %>% 
+  filter(symbol == "GOOGL")
+```
+
+# Exploring Data Analysis
+
+## Time Series Plot
+
+We see much volatility around the stock as observing the upward and downward swings around the time series. We use the close price per day for analysis.
+
+```{r, fig.width = 8, fig.height = 5}
+stock_filtered_tbl %>% 
+  plot_time_series(date, close, 
+                   .interactive = F,
+                   .smooth = F,
+                   .color_var = symbol,
+                   .line_size = 1.5,
+                   .line_alpha = 0.8) +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  scale_color_locuszoom() +
+  theme
+```
+
+## Candlestick Chart
+
+It likes the box chart but with values in high, open, close, and low. High-Open is upper shadow; low-close is lower shadow; open-close is real body.
+
+```{r, fig.width = 8, fig.height = 5}
+stock_filtered_tbl %>% 
+  ggplot(aes(x = date, y = close)) +
+  geom_candlestick(aes(open = open,
+                       high = high,
+                       low = low,
+                       close = close),
+                   size = 1.5,
+                   alpha = 0.5) +
+  geom_ma(ma_fun = SMA, 
+          n = 30, 
+          color = "gray", 
+          size = 1, 
+          linetype = 1) +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  scale_color_locuszoom() +
+  labs(title = "Candlestick Chart",
+       x = NULL,
+       y = NULL) +
+  theme
+```
+
+# Time Series Analysis
+
+## Transforming and Scaling
+
+We transform the close price by using logs and standardizing. We apply transformations to remove noise from our time series.
+
+```{r}
+trans_tbl = stock_filtered_tbl %>%
+  mutate(close = log_interval_vec(close, 
+                                  limit_lower = 0, 
+                                  offset = 1)) %>% 
+  mutate(close = standardize_vec(close))
+```
+
+## Lagging and Rolling
+
+We have some preprocess with the dataset. We have added some lags and rollings to see if we can capture the trend. The trend is an important concept that our model should capture to make more precise predictions. **The lag number will be the forecast period in the latter section**.
+
+- Lag: shift the time series by k periods
+- Rolling: calculates a statistic (the case here is average) for a fixed contiguous block of k periods observation and set in the center of the block
+
+```{r, fig.width = 8, fig.height = 5}
+forecast_h = 30 # lag
+lag_period = 30 # lag
+rolling_avg = c(30, 60, 90, 180)
+complete_tbl = trans_tbl %>%
+  bind_rows(future_frame(.data = ., 
+                         .date_var = date, 
+                         .length_out = forecast_h)) %>%
+  tk_augment_lags(close, 
+                  .lags = lag_period) %>% 
+  tk_augment_slidify(.value = close_lag30, # lag
+                     .f = mean,
+                     .period = rolling_avg,
+                     .align = "center",
+                     .partial = T) %>% 
+  rename_with(.cols = contains("lag"), 
+              .fn = ~str_c("lag_", .))
+complete_prepared_tbl = complete_tbl %>% 
+  filter(!is.na(close))
+forecast_tbl = complete_tbl %>% 
+  filter(is.na(close))
+complete_prepared_tbl %>% 
+  select(date, symbol, close, contains("lag")) %>% 
+  pivot_longer(cols = close:lag_close_lag30_roll_180) %>% # lag
+  plot_time_series(date, 
+                   value, 
+                   name, 
+                   .smooth = F, 
+                   .interactive = F, 
+                   .line_size = 1.5,
+                   .line_alpha = 0.8) + 
+  scale_color_locuszoom() + 
+  theme +
+  theme(legend.position = "bottom") + 
+  labs(title = "Lags Plot",
+       x = NULL,
+       y = "Close Price Transformed")
+```
+
+## Splitting
+
+There are 252 workdays in 2016 for the stock market. And, we split the dataset into 85% training and 15% testing set. The goal of this step is to create a test for our models to learn and test it later.
+
+```{r, fig.width = 8, fig.height = 5}
+split_frame = complete_prepared_tbl %>% 
+  time_series_split(.date_var = date,
+                    assess = "8 weeks",
+                    cumulative = T)
+split_frame %>% 
+  tk_time_series_cv_plan() %>% 
+  plot_time_series_cv_plan(date, 
+                           close, 
+                           .interactive = F,
+                           .line_size = 1.5,
+                           .line_alpha = 0.8) +
+  scale_color_locuszoom() +
+  theme +
+  theme(legend.position = "bottom") + 
+  labs(title = "Dataframe Split",
+       x = NULL,
+       y = "Close Price Transformed")
+```
+
+## Engineering Feature
+
+We prepare our dataset by multiple processes in a sequence. Fourier series helps us represent periodic periods through the use of sine and cosine functions. To make it more simple to think of it as a distribution at a specific period, such as fitting it into a normal distribution.
+
+```{r}
+recipe_basic_specs = recipe(close ~ date,
+       data = training(split_frame)) %>% 
+  step_timeseries_signature(date) %>% 
+  step_fourier(date, 
+               period = c(30, 60, 90, 180),
+               K = 1) %>% 
+  step_rm(matches("(iso)|(xts)|(hour)|(minute)|(second)|(am.pm)|(date_quarter)")) %>% 
+  step_normalize(matches("(index.num)|(yday)")) %>% 
+  step_dummy(all_nominal(), one_hot = T)
+```
+
+## Setting Model
+
+We set up the fitting model process in a workflow. The steps go in a sequence.
+
+```{r}
+# randomforest
+model_rf_fitted = rand_forest() %>% 
+  set_engine("ranger") %>% 
+  set_mode("regression") 
+workflow_rf_fitted = workflow() %>% 
+  add_recipe(recipe_basic_specs) %>% 
+  add_model(model_rf_fitted) %>% 
+  fit(training(split_frame))
+# arima
+model_arima_multi_fitted = arima_reg() %>% 
+  set_engine("auto_arima")
+workflow_arima_multi_fitted = workflow() %>% 
+  add_recipe(recipe_basic_specs) %>% 
+  add_model(model_rf_fitted) %>% 
+  fit(training(split_frame))
+```
+
+## Evaluating
+
+Both models perform similarly. They have their goodness. Based on the criteria, some are favored more with RandomForest; some are favored more with ARIMA. Both models are not as good as we could think of due to only having one year of data and the volatility of this stock.
+
+```{r, fig.width = 8, fig.height = 5}
+models_tbl = modeltime_table(workflow_rf_fitted,
+                             workflow_arima_multi_fitted) %>% 
+  update_model_description(1, "RandomForest") %>% 
+  update_model_description(2, "ARIMA")
+calibration_tbl = models_tbl %>% 
+  modeltime_calibrate(new_data = testing(split_frame))
+accuracy_tbl = calibration_tbl %>% 
+  modeltime_accuracy(metric_set = default_forecast_accuracy_metric_set())
+accuracy_tbl %>%
+  pivot_longer(mae:rsq) %>%
+  mutate(name = name %>% as_factor() %>% fct_reorder(value) %>% fct_rev())%>%
+  ggplot(aes(x = name, 
+             y = value)) + 
+  geom_col(aes(fill = .model_desc), 
+           color = "black") + 
+  facet_wrap(~.model_desc) +
+  geom_label(aes(label = format(value, digits = 2)), 
+             size = 3, 
+             color = "black") +
+  scale_fill_locuszoom() +
+  theme +
+  theme(legend.position = "bottom") +
+  labs(title = "Comparison of Model Accuracy",
+       x = NULL,
+       y = NULL) +
+  guides(fill = guide_legend(title = "Model"))
+```
+
+## Forecasting
+
+### Trainingset with Testingset with Labels
+
+We visualize our model performances. We can see that both models are not able to capture the upswings of the stock around December. It seems that December is a volatile month for this stock.
+
+```{r, fig.width = 8, fig.height = 5}
+calibration_tbl %>% 
+  modeltime_forecast(actual_data = complete_prepared_tbl,
+                     conf_interval = 0.95) %>% 
+  plot_modeltime_forecast(.interactive = F, 
+                          .line_size = 1.5,
+                          .line_alpha = 0.8,
+                          .conf_interval_fill = "gray") +
+  scale_color_locuszoom() +
+  theme +
+  theme(legend.position = "bottom") + 
+  labs(title = "Forecasting on the Testingset",
+       x = NULL,
+       y = "Close Price Transformed")
+```
+
+### Validatingset without Labels
+
+We fit the model with our prepared dataset which is established at 30 days.
+
+```{r, fig.width = 8, fig.height = 5}
+calibration_tbl %>% 
+  modeltime_refit(data = complete_prepared_tbl) %>% 
+  modeltime_forecast(new_data = forecast_tbl,
+                     actual_data = complete_prepared_tbl) %>% 
+  plot_modeltime_forecast(.interactive = F, 
+                          .line_size = 1.5,
+                          .line_alpha = 0.8,
+                          .conf_interval_fill = "gray") +
+  scale_color_locuszoom() +
+  theme +
+  theme(legend.position = "bottom") + 
+  labs(title = "Forecasting on the Validatingset",
+       x = NULL,
+       y = "Close Price Transformed")
+```
+
+### Validatingset without Labels and Retransforming
+
+In the last step, we retransofrm our standardized and log targets to their original amount. This helps us visualize and understand what the actual values we are forecasting loos like.
+
+```{r, fig.width = 8, fig.height = 5}
+refit_tbl = calibration_tbl %>% 
+  modeltime_refit(data = complete_prepared_tbl) 
+# inversion_tbl = trans_tbl %>%
+#   summarise(log_mean = mean(close),
+#             log_mean = as.numeric(format(log_mean, digits = 15)),
+#             sd_rev = sd(close),
+#             sd_rev = as.numeric(format(sd_rev, digits = 15)))
+# inv_mean = inversion_tbl$log_mean
+# inv_sd = inversion_tbl$sd_rev
+refit_tbl %>% 
+  modeltime_forecast(new_data = forecast_tbl,
+                     actual_data = complete_prepared_tbl) %>% 
+  mutate(across(.value:.conf_hi, 
+                .fns = ~standardize_inv_vec(x = ., 
+                                            mean = 2.26601292196241, 
+                                            sd = 0.531019665873533))) %>% 
+  mutate(across(.value:.conf_hi, 
+                .fns = ~log_interval_inv_vec(x = ., 
+                                             limit_lower = 0,
+                                             limit_upper = 852.1999875,
+                                             offset = 1))) %>%
+  plot_modeltime_forecast(.interactive = F, 
+                          .line_size = 1.5,
+                          .line_alpha = 0.8,
+                          .conf_interval_fill = "gray") +
+  scale_color_locuszoom() +
+  theme +
+  theme(legend.position = "bottom") + 
+  labs(title = "Forecasting on the Validatingset with Retransformation",
+       x = NULL,
+       y = "Close Price") +
+  scale_y_continuous(labels = scales::dollar_format())
+```
+
+# Conclusion
+
+We follow steps as implement feature engineering, dataset preprocessing, model setting, modeling training, and forecasting. We can also evaluate the accuracies of the models to see which one works best. But we just assume all the assumptions for the time series as satisfied. Eventually, we search the real Google stock price in this period. However, our forecast is not correct at all. There are two reasons in short to explain this inaccuracy analysis.
+
+Firstly, stock prices go with a **catalyst**, which means important events can impact the trend or direction of the stock price. In a single forecast analysis, we do not have the ability to get the integrated and holistic information into this model for consideration. We might have to use the prophet model for considering special events.
+
+Secondly, stock prices have **momentum**, which means the trend in the past can impact the trend or direction of the stock prices at a certain level. But, we only use one-year data volume. We might have to use a longer period for capturing accurate momentum from this stock.
+
+# Reference
+
+1. [New York Stock Exchange / 2017 / Dominik Gawlik](https://t.ly/w0tp)
+2. [Forecast Analysis / 2021 / Janio Martinez Bachmann](https://t.ly/yIeZ)
